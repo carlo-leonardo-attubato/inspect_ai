@@ -2,6 +2,13 @@ from ._answer import AnswerPattern, answer
 from ._choice import choice
 from ._classification import exact, f1
 from ._match import includes, match
+from ._forecast import (
+    normalized_brier_score,
+    log_score,
+    peer_normalised_brier_score,
+    peer_log_score,
+    probability_score,
+)
 from ._metric import (
     CORRECT,
     INCORRECT,
@@ -75,4 +82,9 @@ __all__ = [
     "max_score",
     "at_least",
     "pass_at",
+    "normalized_brier_score",
+    "log_score",
+    "peer_normalised_brier_score",
+    "peer_log_score",
+    "probability_score",
 ]

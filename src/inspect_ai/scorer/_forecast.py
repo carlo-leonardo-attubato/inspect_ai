@@ -1,221 +1,134 @@
-"""Scoring metrics for forecasting tasks."""
-
+import re
 import math
 import json
-import re
 from typing import Optional
+from inspect_ai._util.text import str_to_float
+from inspect_ai.solver._task_state import TaskState
+from ._metric import CORRECT, INCORRECT, Score
+from ._scorer import Scorer, scorer
+from ._metrics import mean, stderr, accuracy
+from ._target import Target
 
-from .._metric import Score, CORRECT, INCORRECT
-from .._scorer import scorer
-from .._metrics import mean, stderr, accuracy
-from ..._util.pattern import AnswerPattern
-from ...model import TaskState
-from .._target import Target
-
-@scorer(metrics=[mean(), stderr()])
-def normalized_brier_score():
-    async def score(state: TaskState, target: Target):
-        # extract answer
-        match = re.search(AnswerPattern.LINE, state.output.completion)
-        if match:
-            answer = match.group(1)
-            try:
-                pred_prob = float(answer)
-                if 0 <= pred_prob <= 1:
-                    true_prob = float(target.text)
-                    # Calculate raw Brier score
-                    brier = (pred_prob - true_prob) ** 2
-                    # Normalize: random (0.25) -> 0, perfect (0) -> 1
-                    normalized = (0.25 - brier) / 0.25
-                    return Score(
-                        value=normalized,  # Higher is better, range [-3,1]
-                        answer=answer,
-                        explanation=state.output.completion
-                    )
-                else:
-                    # Invalid probability, treat as 0.5
-                    true_prob = float(target.text)
-                    pred_prob = 0.5
-                    brier = (pred_prob - true_prob) ** 2
-                    normalized = (0.25 - brier) / 0.25
-                    return Score(
-                        value=normalized,
-                        answer="0.5",
-                        explanation=f"Invalid probability {answer}, assuming 0.5"
-                    )
-            except ValueError:
-                # Couldn't parse as float, treat as 0.5
-                true_prob = float(target.text)
-                pred_prob = 0.5
-                brier = (pred_prob - true_prob) ** 2
-                normalized = (0.25 - brier) / 0.25
-                return Score(
-                    value=normalized,
-                    answer="0.5",
-                    explanation="Could not parse probability, assuming 0.5"
-                )
-        else:
-            # No answer found, assume 0.5
-            true_prob = float(target.text)
-            pred_prob = 0.5
-            brier = (pred_prob - true_prob) ** 2
-            normalized = (0.25 - brier) / 0.25
-            return Score(
-                value=normalized,
-                answer="0.5",
-                explanation="No probability found in output, assuming 0.5: " 
-                + f"{state.output.completion}"
-            )
-    
-    return score
-
+def _extract_probability(text: str) -> tuple[str, float]:
+    """Extract probability from text and normalize"""
+    text = text.strip()
+    try:
+        prob = str_to_float(text)
+        if 0 <= prob <= 1:
+            return text, prob
+        return "0.5", 0.5
+    except ValueError:
+        return "0.5", 0.5
 
 @scorer(metrics=[mean(), stderr()])
-def log_score():
-    async def score(state: TaskState, target: Target):
-        match = re.search(AnswerPattern.LINE, state.output.completion)
-        if match:
-            answer = match.group(1)
-            try:
-                pred_prob = float(answer)
-                if 0 <= pred_prob <= 1:
-                    true_prob = float(target.text)
-                    # Calculate log score
-                    log_score = math.log(pred_prob if true_prob == 1 else (1 - pred_prob))
-                    return Score(
-                        value=log_score,
-                        answer=answer,
-                        explanation=f"Log score: {log_score:.3f}"
-                    )
-            except ValueError:
-                # Default to random prediction (0.5)
-                true_prob = float(target.text)
-                log_score = math.log(0.5)
-                return Score(
-                    value=log_score,
-                    answer="0.5",
-                    explanation=f"Invalid probability {answer}, using 0.5"
-                )
+def normalized_brier_score() -> Scorer:
+    """Scorer that produces a normalized Brier score
+    0 = random prediction
+    100 = perfect prediction
+    """
+    async def score(state: TaskState, target: Target) -> Score:
+        answer, pred_prob = _extract_probability(state.output.completion)
+        true_prob = float(target.text)
+        
+        brier = (pred_prob - true_prob) ** 2
+        # Scale to 0-100 where:
+        # random (0.25) -> 0
+        # perfect (0) -> 100
+        normalized = (0.25 - brier) / 0.25 * 100
+        
         return Score(
-            value=math.log(0.5),  # Random prediction performance
-            answer="0.5",
-            explanation="No valid probability found, using 0.5"
+            value=float(normalized),
+            answer=answer,
+            explanation=state.output.completion if state.output.completion != answer else None
         )
     return score
 
 @scorer(metrics=[mean(), stderr()])
-def peer_normalised_brier_score():
-    async def score(state: TaskState, target: Target):
-        # Check if community predictions exist
-        if not state.metadata.get('community_predictions'):
-            return Score(
-                value=None,
-                answer="N/A",
-                explanation="No community predictions available"
-            )
-        
-        # Get community predictions and true outcome
-        community_preds = json.loads(state.metadata['community_predictions'])
-        community_prob = community_preds[-1][1]  # Last community prediction
+def log_score() -> Scorer:
+    """Scorer that produces a log score"""
+    async def score(state: TaskState, target: Target) -> Score:
+        answer, pred_prob = _extract_probability(state.output.completion)
         true_prob = float(target.text)
         
-        # Get model prediction
-        match = re.search(AnswerPattern.LINE, state.output.completion)
-        pred_prob = 0.5  # Default prediction
-        if match:
-            try:
-                answer_prob = float(match.group(1))
-                if 0 <= answer_prob <= 1:
-                    pred_prob = answer_prob
-            except ValueError:
-                pass
+        log_score_val = math.log(pred_prob if true_prob == 1 else (1 - pred_prob))
         
-        # Calculate Brier scores
+        return Score(
+            value=float(log_score_val),
+            answer=answer,
+            explanation=state.output.completion if state.output.completion != answer else None
+        )
+    return score
+
+@scorer(metrics=[mean(), stderr()])
+def peer_normalised_brier_score() -> Scorer:
+    """Scorer that compares model Brier score to community predictions
+    Returns the difference in normalized scores (0-100 scale)
+    """
+    async def score(state: TaskState, target: Target) -> Score:
+        try:
+            target_data = json.loads(target.text)
+            true_prob = float(target_data["outcome"])
+            community_prob = float(target_data["community_prediction"])
+        except (json.JSONDecodeError, KeyError, ValueError):
+            return Score(
+                value=math.nan,
+                answer="N/A",
+                explanation="Invalid target data format"
+            )
+
+        answer, pred_prob = _extract_probability(state.output.completion)
+        
         model_brier = (pred_prob - true_prob) ** 2
         community_brier = (community_prob - true_prob) ** 2
         
-        # Normalize both scores
-        model_normalized = (0.25 - model_brier) / 0.25
-        community_normalized = (0.25 - community_brier) / 0.25
-        
-        # Peer score is difference in normalized scores
-        peer_score = model_normalized - community_normalized
+        # Scale both to 0-100
+        model_normalized = (0.25 - model_brier) / 0.25 * 100
+        community_normalized = (0.25 - community_brier) / 0.25 * 100
         
         return Score(
-            value=peer_score,
-            answer=str(pred_prob),
-            explanation=f"Model normalized Brier: {model_normalized:.3f}, Community normalized Brier: {community_normalized:.3f}"
+            value=float(model_normalized - community_normalized),
+            answer=answer,
+            explanation=state.output.completion if state.output.completion != answer else None
         )
     return score
 
 @scorer(metrics=[mean(), stderr()])
-def peer_log_score():
-    async def score(state: TaskState, target: Target):
-        # Check if community predictions exist
-        if not state.metadata.get('community_predictions'):
+def peer_log_score() -> Scorer:
+    """Scorer that compares model log score to community predictions"""
+    async def score(state: TaskState, target: Target) -> Score:
+        try:
+            target_data = json.loads(target.text)
+            true_prob = float(target_data["outcome"])
+            community_prob = float(target_data["community_prediction"])
+        except (json.JSONDecodeError, KeyError, ValueError):
             return Score(
-                value=None,
+                value=math.nan,
                 answer="N/A",
-                explanation="No community predictions available"
+                explanation="Invalid target data format"
             )
+
+        answer, pred_prob = _extract_probability(state.output.completion)
         
-        # Get community predictions and true outcome
-        community_preds = json.loads(state.metadata['community_predictions'])
-        community_prob = community_preds[-1][1]  # Last community prediction
-        true_prob = float(target.text)
-        
-        # Get model prediction
-        match = re.search(AnswerPattern.LINE, state.output.completion)
-        pred_prob = 0.5  # Default prediction
-        if match:
-            try:
-                answer_prob = float(match.group(1))
-                if 0 <= answer_prob <= 1:
-                    pred_prob = answer_prob
-            except ValueError:
-                pass
-        
-        # Calculate log scores
-        model_log_score = math.log(pred_prob if true_prob == 1 else (1 - pred_prob))
-        community_log_score = math.log(community_prob if true_prob == 1 else (1 - community_prob))
-        
-        # Peer score is difference in log scores
-        peer_score = model_log_score - community_log_score
+        model_log = math.log(pred_prob if true_prob == 1 else (1 - pred_prob))
+        community_log = math.log(community_prob if true_prob == 1 else (1 - community_prob))
         
         return Score(
-            value=peer_score,
-            answer=str(pred_prob),
-            explanation=f"Model log score: {model_log_score:.3f}, Community log score: {community_log_score:.3f}"
+            value=float(model_log - community_log),
+            answer=answer,
+            explanation=state.output.completion if state.output.completion != answer else None
         )
     return score
 
 @scorer(metrics=[accuracy(), stderr()])
-def probability_score():
-    async def score(state: TaskState, target: Target):
-        # extract answer
-        match = re.search(AnswerPattern.LINE, state.output.completion)
-        if match:
-            answer = match.group(1)
-            try:
-                prob = float(answer)
-                target_prob = float(target.text)
-                # Consider it correct if within 0.1 of target
-                correct = abs(prob - target_prob) <= 0.1
-                return Score(
-                    value=CORRECT if correct else INCORRECT,
-                    answer=answer,
-                    explanation=state.output.completion
-                )
-            except ValueError:
-                return Score(
-                    value=INCORRECT,
-                    explanation="Could not parse probability"
-                )
-        else:
-            return Score(
-                value=INCORRECT,
-                explanation="Answer not found in model output: "
-                + f"{state.output.completion}"
-            )
-    
+def probability_score() -> Scorer:
+    """Scorer that checks if probability is within 0.1 of target"""
+    async def score(state: TaskState, target: Target) -> Score:
+        answer, pred_prob = _extract_probability(state.output.completion)
+        target_prob = float(target.text)
+        
+        return Score(
+            value=CORRECT if abs(pred_prob - target_prob) <= 0.1 else INCORRECT,
+            answer=answer,
+            explanation=state.output.completion if state.output.completion != answer else None
+        )
     return score
