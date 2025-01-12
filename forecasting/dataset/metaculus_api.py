@@ -1,6 +1,6 @@
 # forecasting/dataset/metaculus.py
 from dataclasses import dataclass
-from typing import List, Optional, Set, AsyncIterator, Any, Dict, Iterator
+from typing import List, Optional, AsyncIterator, Any, Dict, Iterator
 from datetime import datetime
 import httpx
 import logging
@@ -10,13 +10,8 @@ logger = logging.getLogger(__name__)
 API_BASE_URL = "https://www.metaculus.com/api/posts/"
 
 @dataclass
-class MetaculusConfig:
-    """Configuration for Metaculus dataset."""
-    # Field selection
-    input_fields: Set[str] = None
-    target_fields: Set[str] = None
-    
-    # API configuration
+class MetaculusAPIConfig:
+    """Configuration for Metaculus API access."""
     api_key: Optional[str] = None
     api_base_url: str = API_BASE_URL
     
@@ -35,31 +30,11 @@ class MetaculusConfig:
     def __post_init__(self):
         if self.statuses is None:
             self.statuses = ["resolved"]
-            
-        if self.input_fields is None:
-            self.input_fields = {
-                "id", "title", "description", "created_at", "open_time",
-                "type", "options", "possibilities", "resolution_criteria",
-                "fine_print", "label", "scaling", "published_at", 
-                "projects", "author_id", "author_username"
-            }
-            
-        if self.target_fields is None:
-            self.target_fields = {
-                "id", "title", "description", "created_at", "open_time",
-                "type", "options", "possibilities", "resolution_criteria",
-                "fine_print", "label", "scaling", "resolution", 
-                "resolution_set_time", "actual_close_time",
-                "actual_resolve_time", "status", "author_id", 
-                "author_username", "published_at", "comment_count", 
-                "nr_forecasters", "forecasts_count", "projects", 
-                "vote", "aggregations"
-            }
 
 class MetaculusDataset(Dataset):
     """Dataset that lazily loads from Metaculus API."""
     
-    def __init__(self, config: MetaculusConfig):
+    def __init__(self, config: MetaculusAPIConfig):
         self.config = config
         self._client = None
         self._next_url = config.api_base_url
@@ -73,7 +48,6 @@ class MetaculusDataset(Dataset):
                 self._client.headers["Authorization"] = f"Token {self.config.api_key}"
     
     async def _fetch_next_page(self) -> bool:
-        """Fetch next page of results. Returns False if no more pages."""
         if not self._next_url:
             return False
             
@@ -109,42 +83,13 @@ class MetaculusDataset(Dataset):
             logger.error(f"Error fetching posts: {str(e)}")
             return False
     
-    def _post_to_sample(self, post: Dict[str, Any]) -> Sample:
-        """Convert API post to Sample"""
-        input_data = {}
-        target_data = {}
-        
-        for field in self.config.input_fields:
-            if field in post:
-                input_data[field] = post[field]
-            elif field in post["question"]:
-                input_data[field] = post["question"][field]
-                
-        for field in self.config.target_fields:
-            if field in post:
-                target_data[field] = post[field]
-            elif field in post["question"]:
-                target_data[field] = post["question"][field]
-        
-        return Sample(input=input_data, target=target_data)
-    
-    async def __aiter__(self) -> AsyncIterator[Sample]:
+    async def __aiter__(self) -> AsyncIterator[Dict]:
+        """Yields raw API response data for each post."""
         while True:
-            # If we've exhausted current page, try to fetch next
             if self._current_idx >= len(self._current_page):
                 if not await self._fetch_next_page():
                     break
             
-            # Yield next sample from current page
             if self._current_idx < len(self._current_page):
-                yield self._post_to_sample(self._current_page[self._current_idx])
+                yield self._current_page[self._current_idx]
                 self._current_idx += 1
-    
-    def __iter__(self) -> Iterator[Sample]:
-        raise NotImplementedError("Use async iteration with MetaculusDataset")
-    
-    def __len__(self) -> int:
-        raise NotImplementedError("Length not known until iteration complete")
-    
-    def __getitem__(self, idx: int) -> Sample:
-        raise NotImplementedError("Random access not supported for MetaculusDataset")
